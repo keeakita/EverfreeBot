@@ -37,10 +37,13 @@ $mail_opts = {
   :from => 'root@techdude300.usa.cc',
   :to => 'techdude300@gmail.com',
   :subject => "#{$nick} crashed!"}
-  
+
+#Variables needed for asessing when to restart after failure
 $error_time_arr = Array.new
 $tries = 0
 
+#Used to prevent threads from clashing
+#All file and socket access must use this
 $mutex =  Mutex.new
 
 def main
@@ -49,6 +52,7 @@ def main
   $users = []
   $ignore_arr = []
   
+  #Sends a raw message to the IRC server (appends \r\n for convenience)
   def send_raw(message)
     $mutex.synchronize() do
       $socket.print(message + "\r\n")
@@ -56,20 +60,24 @@ def main
     end
   end
   
+  #Sends a message (PRVIMSG) directly to a user
   def send_to_user(user, message)
     send_raw("PRIVMSG " + user + " :" + message)
   end
   
+  #Sends a message (PRIVMSG) to a channel
   def send_to_channel(message)
     send_to_user($channel, message)
     log($nick + ": " + message)
   end
-  
+
+  #Quit gracefully
   def terminate
     send_raw("PART " + $channel + " :terminated().")
     send_raw("QUIT :terminated().")
   end
-  
+ 
+  #Log to a file (if configured)
   def log(message)
     if $log
       $mutex.synchronize do
@@ -80,8 +88,10 @@ def main
     end
   end
 
+  #Start our thread to check for site updates
   $spider = Thread.new {
       begin
+        #Log to a file (if configured)
         def log(message)
           if $log
             log_file = File.new($logdir + Date.today.strftime('%F') + ".txt", "a")
@@ -89,10 +99,11 @@ def main
             log_file.close
           end
         end
-        
+       
+        #Send post to the channel
         def send(post)
           #TODO: Find out why it might be nil
-          unless post.index(":").nil? || $ignore_arr.include?(post[0..post.index(":")-1])
+          unless post.index(":").nil? 
             #Selectively remove @tags to avoiding pinging
             temp_arr = []
             post.split(' ').each do |word|
@@ -122,6 +133,8 @@ def main
             else
               tmp = "New post by " + post
             end
+
+            #Send the post
             $mutex.synchronize() do
               $socket.print("PRIVMSG " + $channel + " :" + tmp + "\r\n")
               log($nick + ": " + tmp)
@@ -131,10 +144,15 @@ def main
           end
         end
 
+        #Arrays to hold the content from the current & last checks
         old = nil
         new = nil
         
+        #Stop the thread and wait until we're connected to the channel
+        #The thread will be started later in this script from the main thread
         Thread.stop
+
+        #Fetch the new data and parse it
         while 1 do
           xml = Net::HTTP.get($feed_server, $feed_page).split("\n")
           new = []
@@ -143,7 +161,8 @@ def main
               new << Hash[:content => xml[x + 1].lstrip.rstrip[7..-9].gsub(/&quot;/, '"'), :time => DateTime.parse(xml[x + 3].lstrip.rstrip[9..-11]), :id => xml[x + 4].lstrip.rstrip[6..-8].split("/")[-1].to_i]
             end
           end
-          
+         
+          #Check for new posts
           if old
             new.each do |entry|
               if old[0][:time] < entry[:time]
@@ -156,11 +175,14 @@ def main
             end
           end
           
+          #The old array is now the same as the new
           old = new.dup
           
-          #puts "sleeping for 10 seconds..."
+          #Check only every 5 seconds
+          #Can be adjusted to save bandwith
           sleep(5)
         end
+      #Log errors and disconnect gracefully
       rescue => e
         errorFile = File.new($dir + "error.txt", "a")
         errorFile.puts(Time.now.to_s)
@@ -174,7 +196,8 @@ def main
         $spider.exit
       end
     }
- 
+
+  #Load the ignore file. If it doesn't exist, create it.
   if File.exists? $dir + "ignore.txt"
     ignore_file = File.new($dir + "ignore.txt", "r")
     ignore_file.each { |line| $ignore_arr << line.rstrip }
@@ -184,6 +207,7 @@ def main
     ignore_file.close
   end
   
+  #If the spider is still running, fetch a message and process it
   while $spider.alive? && (message = $socket.gets) do
     
     puts message
@@ -242,41 +266,47 @@ def main
       send_to_channel($greetings[rand($greetings.length)].gsub(/\$name/, $nick) + " (Started in " + (Time.now - $start_time).to_s + " seconds.)")
     end
     
+    #Only process messages sent to the current channel
     if to == $channel && code == "PRIVMSG"
       
+      #Strip ACTIONS, they mess up logic
       if (text.start_with? "\x01ACTION") && (text.end_with? "\x01")
         log(from[1..-1].split("!")[0] + text[7..-2])
       else
         log(from[1..-1].split("!")[0] + ": " + text)
       end
       
+      #Add user to the ignore list, or tell the user they've already been added
       if text.start_with? "!ignore "
         if $ignore_arr.index(text[8..-1].rstrip.lstrip).nil?
           $ignore_arr << text[8..-1].rstrip.lstrip
           ignore_file = File.new($dir + "ignore.txt", "a")
           ignore_file.puts(text[8..-1].rstrip.lstrip)
           ignore_file.close
-          send_to_channel("User " + text[8..-1] + "'s posts will be ignored.")
+          send_to_channel("Tags for #{text[8..-1]} will be removed.")
         else
-          send_to_channel("User " + text[8..-1] + " is already being ignored.")
+          send_to_channel("Tags for #{text[8..-1]} are already being removed.")
         end
       end
       
+      #Remove user from the ignore list, or tell the user they've already been removed
       if text.start_with? "!watch "
         if $ignore_arr.delete(text[7..-1].rstrip.lstrip)
           File.delete($dir + "ignore.txt")
           ignore_file = File.new($dir + "ignore.txt", "w")
           $ignore_arr.each { |entry| ignore_file.puts(entry)}
           ignore_file.close
-          send_to_channel("User " + text[7..-1] + "'s posts are now being tracked.")
+          send_to_channel("Tags for #{text[7..-1]} are no longer being removed.")
         else
-          send_to_channel("User " + text[7..-1] + " is not being ignored.")
+          send_to_channel("Tags for #{text[7..-1]} are already not being removed.")
         end
       end
       
+      #Send a response when mentioned
       send_to_channel($responses[rand($responses.length)]) if text.downcase.include? $nick.downcase 
     end
     
+    #Log various events
     if to == $channel && code == "JOIN"
       log(from[1..-1].split("!")[0] + " joined the channel.")
     end
@@ -293,9 +323,13 @@ def main
       log(from[1..-1].split("!")[0] + " changed their name to #{text}.")
     end
   end
-  
+ 
+  #We'll never reach this point unless our spider died
+  #Throw an error so the bot can restart itself
   raise("Update thread has stopped.")
+#Catch any errors and handle them
 rescue => e
+  #Send an email
   stdin = Open3.popen3("sendmail -t #{$mail_opts[:to]}")[0]
   stdin.puts "From: #{$mail_opts[:from]}"
   stdin.puts "To: #{$mail_opts[:to]}"
@@ -304,6 +338,7 @@ rescue => e
   stdin.puts "#{$nick} has encountered an error!\n\nHere are the error details:\n#{e.message}\n#{e.backtrace}\n\nPlease make sure the bot is still running."
   stdin.puts
   stdin.close
+  #Save the error info to file and leave the server
   $mutex.synchronize() do
     errorFile = File.new($dir + "error.txt", "a")
     errorFile.puts(Time.now.to_s)
@@ -316,7 +351,8 @@ rescue => e
     log_file.puts(Time.now.strftime("[%m/%d/%y %H:%M:%S] ") + "ERROR: " + e.message)
     log_file.close
   end
-  
+ 
+  #reconnect unless there have been to many reconnection attempts
   $error_time_arr << Time.now
   if $error_time_arr.length > 2
     if (7 * 60) > ($error_time_arr[2] - $error_time_arr[1])
@@ -325,6 +361,7 @@ rescue => e
     $error_time_arr.shift
   end
   
+  #Wait 30 seconds to retry - may solve network issues
   sleep(30)
   main
 end
