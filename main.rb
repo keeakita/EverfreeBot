@@ -6,6 +6,7 @@ require 'socket'
 require 'net/http'
 require 'date'
 require 'open3'
+require 'time'
 
 Thread.abort_on_exception = true
 
@@ -90,71 +91,84 @@ def main
 
   #Start our thread to check for site updates
   $spider = Thread.new {
-      begin
-        #Log to a file (if configured)
-        def log(message)
-          if $log
-            log_file = File.new($logdir + Date.today.strftime('%F') + ".txt", "a")
-            log_file.puts(Time.now.strftime("[%m/%d/%y %H:%M:%S] ") + message)
-            log_file.close
-          end
+    begin
+      #Log to a file (if configured)
+      def log(message)
+        if $log
+          log_file = File.new($logdir + Date.today.strftime('%F') + ".txt", "a")
+          log_file.puts(Time.now.strftime("[%m/%d/%y %H:%M:%S] ") + message)
+          log_file.close
         end
-       
-        #Send post to the channel
-        def send(post)
-          #TODO: Find out why it might be nil
-          unless post.index(":").nil? 
-            #Selectively remove @tags to avoiding pinging
-            temp_arr = []
-            post.split(' ').each do |word|
-              if word =~ /\A\@\w+/
-                unless $ignore_arr.include?(word[1..-1])
-                  temp_arr.push(word)
-                end
-              else
+      end
+     
+      #Send post to the channel
+      def send(post)
+        #TODO: Find out why it might be nil
+        unless post.index(":").nil? 
+          #Selectively remove @tags to avoiding pinging
+          temp_arr = []
+          post.split(' ').each do |word|
+            if word =~ /\A\@\w+/
+              unless $ignore_arr.include?(word[1..-1])
                 temp_arr.push(word)
               end
-            end
-            post = temp_arr.join(' ');
-
-            puts post
-
-            #Change the name to [n]ame to avoid pinging
-            post_array = post.split(':')
-            name = post_array[0]
-            name = "[" + name[0] + "]" + name[1..-1]
-            post_array[0] = name
-            post = post_array.join(":")
-            
-            #Make sure we don't send giant posts
-            #TODO: Make it break on whitespace
-            if post.length > 60
-              tmp = "New post by " + post[0..60] + "..."
             else
-              tmp = "New post by " + post
+              temp_arr.push(word)
             end
-
-            #Send the post
-            $mutex.synchronize() do
-              $socket.print("PRIVMSG " + $channel + " :" + tmp + "\r\n")
-              log($nick + ": " + tmp)
-              puts tmp
-            end
-            sleep(1)
           end
+          post = temp_arr.join(' ');
+
+          puts post
+
+          #Change the name to [n]ame to avoid pinging
+          post_array = post.split(':')
+          name = post_array[0]
+          name = "[" + name[0] + "]" + name[1..-1]
+          post_array[0] = name
+          post = post_array.join(":")
+          
+          #Make sure we don't send giant posts
+          #TODO: Make it break on whitespace
+          if post.length > 60
+            tmp = "New post by " + post[0..60] + "..."
+          else
+            tmp = "New post by " + post
+          end
+
+          #Send the post
+          $mutex.synchronize() do
+            $socket.print("PRIVMSG " + $channel + " :" + tmp + "\r\n")
+            log($nick + ": " + tmp)
+            puts tmp
+          end
+          sleep(1)
         end
+      end
 
-        #Arrays to hold the content from the current & last checks
-        old = nil
-        new = nil
-        
-        #Stop the thread and wait until we're connected to the channel
-        #The thread will be started later in this script from the main thread
-        Thread.stop
+      #Arrays to hold the content from the current & last checks
+      old = nil
+      new = nil
 
-        #Fetch the new data and parse it
-        while 1 do
-          xml = Net::HTTP.get($feed_server, $feed_page).split("\n")
+      last_modified = nil;
+      
+      #Stop the thread and wait until we're connected to the channel
+      #The thread will be started later in this script from the main thread
+      Thread.stop
+
+      #Fetch the new data and parse it
+      while 1 do
+        #Fetch the feed
+        if last_modified.nil? then last_modified = Time.now end
+        req = Net::HTTP.new($feed_server, 80)
+        if !old
+          #Force loading the page
+          response = req.get($feed_page)
+        else
+          response = req.get($feed_page, { 'If-Modified-Since' => last_modified.httpdate } )
+        end
+        if response.code == "200"
+          last_modified = Time.parse(response['last-modified'])
+          xml = response.body.split("\n")
           new = []
           for x in 0..(xml.length - 1) do
             if xml[x].include?("<item>")
@@ -180,22 +194,29 @@ def main
           
           #Check only every 5 seconds
           #Can be adjusted to save bandwith
-          sleep(5)
+        elsif response.code != "304"
+          if response.code.to_i >= 400
+            raise("HTTP error #{response.code}")
+          else
+            raise("Don't know how to handle HTTP #{response.code}")
+          end
         end
-      #Log errors and disconnect gracefully
-      rescue => e
-        errorFile = File.new($dir + "error.txt", "a")
-        errorFile.puts(Time.now.to_s)
-        errorFile.puts(e.message)
-        errorFile.puts(e.backtrace)
-        errorFile.close
-        $socket.print("PRIVMSG #{$channel} :I don't feel so well... (" + e.message + ")\r\n")
-        puts e.message
-        puts e.backtrace
-        $socket.print("QUIT\r\n")
-        $spider.exit
+        sleep(5)
       end
-    }
+    #Log errors and disconnect gracefully
+    rescue => e
+      errorFile = File.new($dir + "error.txt", "a")
+      errorFile.puts(Time.now.to_s)
+      errorFile.puts(e.message)
+      errorFile.puts(e.backtrace)
+      errorFile.close
+      $socket.print("PRIVMSG #{$channel} :I don't feel so well... (" + e.message + ")\r\n")
+      puts e.message
+      puts e.backtrace
+      $socket.print("QUIT\r\n")
+      $spider.exit
+    end
+  }
 
   #Load the ignore file. If it doesn't exist, create it.
   if File.exists? $dir + "ignore.txt"
