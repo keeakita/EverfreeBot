@@ -47,6 +47,17 @@ $tries = 0
 #All file and socket access must use this
 $mutex =  Mutex.new
 
+#Disconnect gracefully on SIGTERM
+Signal.trap(0) {
+  puts "Terminating..."
+  begin
+    $socket.print("QUIT :Caught SIGTERM!\r\n")
+    exit
+  rescue
+    exit
+  end
+}
+
 def main
   $start_time = Time.now
   $socket = TCPSocket.open($server, $port)
@@ -72,12 +83,6 @@ def main
     log($nick + ": " + message)
   end
 
-  #Quit gracefully
-  def terminate
-    send_raw("PART " + $channel + " :terminated().")
-    send_raw("QUIT :terminated().")
-  end
- 
   #Log to a file (if configured)
   def log(message)
     if $log
